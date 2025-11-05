@@ -200,12 +200,7 @@ impl<'a, 'w, W: io::Write> Serializer for &'a mut SeRecord<'w, W> {
         self,
         _len: Option<usize>,
     ) -> Result<Self::SerializeMap, Self::Error> {
-        // The right behavior for serializing maps isn't clear.
-        Err(Error::custom(
-            "serializing maps is not supported, \
-             if you have a use case, please file an issue at \
-             https://github.com/BurntSushi/rust-csv",
-        ))
+        Ok(self)
     }
 
     fn serialize_struct(
@@ -299,18 +294,18 @@ impl<'a, 'w, W: io::Write> SerializeMap for &'a mut SeRecord<'w, W> {
         &mut self,
         _key: &T,
     ) -> Result<(), Self::Error> {
-        unreachable!()
+        Ok(())
     }
 
     fn serialize_value<T: ?Sized + Serialize>(
         &mut self,
-        _value: &T,
+        value: &T,
     ) -> Result<(), Self::Error> {
-        unreachable!()
+        value.serialize(&mut **self)
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        unreachable!()
+        Ok(())
     }
 }
 
@@ -646,12 +641,7 @@ impl<'a, 'w, W: io::Write> Serializer for &'a mut SeHeader<'w, W> {
         self,
         _len: Option<usize>,
     ) -> Result<Self::SerializeMap, Self::Error> {
-        // The right behavior for serializing maps isn't clear.
-        Err(Error::custom(
-            "serializing maps is not supported, \
-             if you have a use case, please file an issue at \
-             https://github.com/BurntSushi/rust-csv",
-        ))
+        self.handle_container("map")
     }
 
     fn serialize_struct(
@@ -743,20 +733,37 @@ impl<'a, 'w, W: io::Write> SerializeMap for &'a mut SeHeader<'w, W> {
 
     fn serialize_key<T: ?Sized + Serialize>(
         &mut self,
-        _key: &T,
+        key: &T,
     ) -> Result<(), Self::Error> {
-        unreachable!()
+        // Grab old state and update state to `EncounteredStructField`.
+        let old_state =
+            mem::replace(&mut self.state, HeaderState::EncounteredStructField);
+        if let HeaderState::ErrorIfWrite(err) = old_state {
+            return Err(err);
+        }
+
+        let mut key_serializer = SeRecord { wtr: self.wtr };
+        key.serialize(&mut key_serializer)?;
+        self.state = HeaderState::InStructField;
+        Ok(())
     }
 
     fn serialize_value<T: ?Sized + Serialize>(
         &mut self,
-        _value: &T,
+        value: &T,
     ) -> Result<(), Self::Error> {
-        unreachable!()
+        if !matches!(self.state, HeaderState::InStructField) {
+            return Err(Error::new(ErrorKind::Serialize(
+                "Attempted to serialize value without key".to_string(),
+            )));
+        }
+        value.serialize(&mut **self)?;
+        self.state = HeaderState::EncounteredStructField;
+        Ok(())
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        unreachable!()
+        Ok(())
     }
 }
 
@@ -809,6 +816,8 @@ impl<'a, 'w, W: io::Write> SerializeStructVariant for &'a mut SeHeader<'w, W> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use {bstr::ByteSlice, serde::Serialize};
 
     use crate::{
@@ -1324,5 +1333,96 @@ mod tests {
         let (wrote, got) = serialize_header(row.clone());
         assert!(wrote);
         assert_eq!(got, "label,num,label2,value,empty,label,num");
+    }
+
+    #[test]
+    fn flatten() {
+        #[derive(Clone, Serialize, Debug, PartialEq)]
+        struct Input {
+            x: f64,
+            y: f64,
+        }
+
+        #[derive(Clone, Serialize, Debug, PartialEq)]
+        struct Properties {
+            prop1: f64,
+            prop2: f64,
+        }
+
+        #[derive(Clone, Serialize, Debug, PartialEq)]
+        struct Row {
+            #[serde(flatten)]
+            input: Input,
+            #[serde(flatten)]
+            properties: Properties,
+        }
+        let row = Row {
+            input: Input { x: 1.0, y: 2.0 },
+            properties: Properties { prop1: 3.0, prop2: 4.0 },
+        };
+
+        let got = serialize(row.clone());
+        assert_eq!(got, "1.0,2.0,3.0,4.0\n");
+
+        let (wrote, got) = serialize_header(row.clone());
+        assert!(wrote);
+        assert_eq!(got, "x,y,prop1,prop2");
+    }
+
+    #[test]
+    fn flatten_map() {
+        #[derive(Clone, Serialize, Debug, PartialEq)]
+        struct Row {
+            x: f64,
+            y: f64,
+            #[serde(flatten)]
+            extra: BTreeMap<&'static str, f64>,
+        }
+        let mut extra = BTreeMap::new();
+        extra.insert("extra1", 3.0);
+        extra.insert("extra2", 4.0);
+        let row = Row { x: 1.0, y: 2.0, extra };
+
+        let got = serialize(row.clone());
+        assert_eq!(got, format!("1.0,2.0,3.0,4.0\n"));
+
+        let (wrote, got) = serialize_header(row.clone());
+        assert!(wrote);
+        assert_eq!(got, format!("x,y,extra1,extra2"));
+    }
+
+    #[test]
+    fn flatten_map_different_num_entries() {
+        #[derive(Clone, Serialize, Debug, PartialEq)]
+        struct Row {
+            x: f64,
+            y: f64,
+            #[serde(flatten)]
+            extra: BTreeMap<&'static str, f64>,
+        }
+        let mut wtr = Writer::from_writer(vec![]);
+
+        let mut extra = BTreeMap::new();
+        extra.insert("extra1", 3.0);
+        extra.insert("extra2", 4.0);
+        let row = Row { x: 1.0, y: 2.0, extra };
+        wtr.serialize(row).unwrap();
+
+        let mut extra = BTreeMap::new();
+        extra.insert("extra3", 3.0);
+        extra.insert("extra4", 4.0);
+        extra.insert("extra5", 5.0);
+        let row = Row { x: 1.0, y: 2.0, extra };
+        let error = wtr.serialize(row).unwrap_err();
+        match *error.kind() {
+            ErrorKind::UnequalLengths {
+                pos: None,
+                expected_len: 4,
+                len: 5,
+            } => {}
+            ref x => {
+                panic!("expected ErrorKind::UnequalLengths but got '{x:?}'")
+            }
+        }
     }
 }
