@@ -744,9 +744,15 @@ impl<'a, 'w, W: io::Write> SerializeMap for &'a mut SeHeader<'w, W> {
         }
 
         self.wtr.check_map_key(key)?;
+        self.state = HeaderState::InStructField;
+        key.serialize(&mut **self)?; // This does not actually serialize anything, just checks that the key is a scalar value.
+        if let HeaderState::ErrorIfWrite(err) =
+            mem::replace(&mut self.state, HeaderState::InStructField)
+        {
+            return Err(err);
+        }
         let mut key_serializer = SeRecord { wtr: self.wtr };
         key.serialize(&mut key_serializer)?;
-        self.state = HeaderState::InStructField;
         Ok(())
     }
 
@@ -1152,6 +1158,24 @@ mod tests {
         let (wrote, got) = serialize_header(map);
         assert!(wrote);
         assert_eq!(got, "a,b");
+    }
+
+    #[test]
+    fn ordered_map_with_collection_as_key() {
+        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+        struct MyKey {
+            name: &'static str,
+            other_attribute: u8,
+        }
+
+        let mut map = BTreeMap::new();
+        map.insert(MyKey { name: "a", other_attribute: 1 }, 2.0);
+
+        let error = serialize_header_err(map);
+        assert!(
+            matches!(error.kind(), ErrorKind::Serialize(_)),
+            "Expected ErrorKind::Serialize but got '{error}'"
+        );
     }
 
     #[test]
